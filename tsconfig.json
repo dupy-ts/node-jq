@@ -1,0 +1,23 @@
+{
+  "ts-node-dev": { "files": true },
+  "ts-node": { "files": true },
+  "compilerOptions": {
+    "target": "esnext",
+    "lib": ["ESNext"],
+    "strictNullChecks": true,
+    "declaration": true,
+    "module": "commonjs",
+    "noImplicitAny": true,
+    "preserveConstEnums": true,
+    "downlevelIteration": true,
+    "strict": false,
+    "sourceMap": true,
+    "outDir": "dist",
+    "allowSyntheticDefaultImports": true,
+    "experimentalDecorators": true
+  },
+  "include": [
+    "./src/**/*.ts",
+    "./declaration.d.ts"
+  ],
+}
