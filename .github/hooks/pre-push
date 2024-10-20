@@ -1,0 +1,655 @@
+#!/usr/bin/env node
+
+const semver = require('semver');
+const child_process = require('child_process');
+const os = require('os');
+const Path = require('path');
+const getAuthToken = require('registry-auth-token')
+const fs = require('fs');
+const {randomUUID} = require("crypto");
+
+const GIST_ID = '7630ee0b3287d567a0f79862ee46f0a2';
+const MAIN_BRANCH="main"
+const ORGANIZATION="dupy-ts"
+const NPM_REGISTRY="https://npm.pkg.github.com/"
+
+async function getAvailableVersionsInRange(packageName, npmToken, versionRange) {
+  const uri = new URL(encodeURIComponent(packageName).replace(/^%40/, '@'), NPM_REGISTRY);
+
+  const response = await fetch(uri, {
+    headers: {
+      authorization: `Bearer ${npmToken}`,
+      accept: 'application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*',
+    },
+  });
+
+  if (response.status === 404) {
+    return [];
+  }
+
+  const data = await response.json();
+
+  if ('error' in data) {
+    throw new Error(data['error']);
+  }
+
+  const versions = (() => {
+    if (typeof data === 'object' && data !== null) {
+      const versions = data['versions'];
+      if (typeof versions === 'object' && versions !== null) {
+        return Object.keys(versions);
+      }
+    }
+    return [];
+  })();
+
+  return versions.filter(version => semver.satisfies(version, versionRange));
+}
+
+const execute = (command, cwd) => {
+  return new Promise((resolve, reject) => {
+    child_process.exec(command,{
+      cwd: cwd,
+    },(error, stdout, stderr) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(stdout);
+    })
+  })
+};
+
+
+
+const publish = async (directory) => {
+  console.log(`Fetching the branch name in ${Path.basename(directory)}`);
+  const branch = (await (async () => {
+    const platform = os.platform();
+
+    if (platform === 'win32') {
+      return execute(`powershell -Command "$branch = git symbolic-ref HEAD; $branch -replace '.*/(.+)', '$1'"`);
+    }
+
+    return execute(`git symbolic-ref HEAD | sed -e 's,.*/\\(.*\\),\\1,'`)
+  })()).trim();
+  console.log(`The branch name of the directory ${Path.basename(directory)} has been fetched: ${branch}`);
+
+  if (branch !== MAIN_BRANCH){
+    console.log(`We don't proceed the directory ${Path.basename(directory)} because the branch name is not ${MAIN_BRANCH} but ${branch}`);
+    return;
+  }
+
+
+  console.log(`Fetching the package.json in the directory ${Path.basename(directory)}`);
+  const rootPackage = JSON.parse(await fs.promises.readFile(Path.join(directory,"./package.json"),{encoding: "utf-8"}));
+  console.log(`The package.json in the directory ${Path.basename(directory)} has been fetched`);
+
+  const npm_token = await getAuthToken(NPM_REGISTRY).token;
+
+  console.log(`Checking if the package ${rootPackage.name}@${rootPackage.version} is available in the registry ${NPM_REGISTRY}`)
+  const available = await (async () => {
+    const uri = new URL(encodeURIComponent(rootPackage.name).replace(/^%40/, '@'), NPM_REGISTRY)
+
+    const response = await fetch(uri, {
+      headers: {
+        authorization: `Bearer ${npm_token}`,
+        accept: 'application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*',
+      },
+    })
+
+    if (response.status === 404){
+      return true;
+    }
+
+    const data = await response.json();
+
+    if ('error' in data) {
+      throw new Error(data['error']);
+    }
+
+    const versions = (() => {
+      if (typeof data === 'object' && data !== null) {
+        const versions = data['versions']
+        if (typeof versions === 'object' && versions !== null) {
+          return Object.keys(versions)
+        }
+      }
+
+      return []
+    })()
+
+    return !versions.some(v => v === rootPackage.version);
+  })();
+
+  if (!available){
+    console.log(`We don't proceed the package ${rootPackage.name}@${rootPackage.version} has been already been pushed in the registry ${NPM_REGISTRY}`);
+    return;
+  }
+  console.log(`The package ${rootPackage.name}@${rootPackage.version} is available in the registry ${NPM_REGISTRY}`)
+
+  const dev = rootPackage['devDependencies'] ?? {};
+  const prod = rootPackage['dependencies'] ?? {};
+  let error = false;
+  if (typeof rootPackage['peerDependencies'] === "object" && rootPackage['peerDependencies'] !== null){
+    for(const [key,range] of Object.entries(rootPackage['peerDependencies'])){
+      console.log(`Check if the package ${key} is installed as dev dependencies`);
+      const _dev = dev[key];
+      if (typeof _dev !== "string"){
+        console.error(`The package ${key} is listed in the peer dependencies (with the range ${range}) but it's not installed as a dev dependencies`)
+        error = true;
+        continue
+      }
+      console.log(`The package ${key} is listed is installed as a production dependencies`)
+
+      console.log(`Check if the package ${key} is not installed as a production dependencies`);
+      const _prod = prod[key];
+      if (typeof _prod === "string"){
+        console.error(`The package ${key} is listed in the peer dependencies (with the range ${range}) but it's installed as a production dependencies (with a version ${prod}) and as a development dependencies (with a version ${dev})`)
+        error = true;
+        continue
+      }
+      console.log(`The package ${key} is not installed as a prod dependencies`);
+
+
+      console.log(`Check if the installed package ${key}@${_dev} is in the range given in the peer dependency ${range}`);
+      if (!semver.satisfies(_dev,range)){
+        console.error(`The installed package ${key}@${_dev} doesn't satisfy the range given in the peer dependency ${range}`)
+        error = true;
+        continue
+      }
+      console.log(`The installed package ${key}@${_dev} satisfies the range given in the peer dependency ${range}`)
+    }
+  }
+
+  if (error === true){
+    process.exit(1)
+    return
+  }
+
+
+  console.log(`Checking the package lock of the project in ${Path.basename(directory)}`);
+  try {
+    await execute('npm ci --ignore-scripts',directory)
+  }catch (e){
+    console.error(`We don't proceed the directory ${Path.basename(directory)} because package lock has some issues`);
+    process.exit(1)
+    return
+  }
+  console.log(`The package lock of the project in ${Path.basename(directory)} has been checked`);
+
+  console.log(`Checking the linting of the project in ${Path.basename(directory)}`);
+  try {
+    await execute("npx eslint \"./src/**\" --ext \".js,.jsx,.ts,.tsx\" -c \"./.eslintrc.js\" --no-eslintrc",directory)
+  }catch (e){
+    console.error(`We don't proceed the directory ${Path.basename(directory)} because the linting has some issues`);
+    process.exit(1)
+    return
+  }
+  console.log(`The linting of the project in ${Path.basename(directory)} has been checked`);
+
+
+  console.log(`Checking the typescript of the project in ${Path.basename(directory)}`);
+  try {
+    await execute('npx tsc --noEmit --project \"./tsconfig.json\"',directory)
+  }catch (e){
+    console.error(`We don't proceed the directory ${Path.basename(directory)} because the linting has some issues`);
+    process.exit(1)
+    return
+  }
+  console.log(`The typescript of the project in ${Path.basename(directory)} has been checked`);
+
+
+
+  if (typeof rootPackage['peerDependencies'] === "object" && rootPackage['peerDependencies'] !== null){
+    for(const [key,range] of Object.entries(rootPackage['peerDependencies'])){
+      if (!key.slice(1).trim().startsWith(ORGANIZATION.trim()+"/")){
+        continue;
+      }
+      console.log(`Fetch all the available version of ${key} who satisfy the range ${range}`);
+      const available = await getAvailableVersionsInRange(key,npm_token,range);
+      console.log(`All the available version of ${key} who satisfy the range ${range} has been fetch: ${available.length} found`);
+
+      for(const version of available){
+        console.log(`Install the package ${key}@${version} as dev dependency`);
+        try{
+          await execute(`npm i -D ${key}@${version} --ignore-scripts`);
+        }catch (e){
+          console.error(`The package ${key}@${version} failed to been installed as a dev dependency`);
+          process.exit(1)
+          return
+        }
+        console.log(`The package ${key}@${version} as been installed as a dev dependency`);
+
+        console.log(`Check the typescript implementation of the project ${Path.basename(directory)} with ${key}@${version}`);
+        try{
+          await execute('npx tsc --noEmit --project \"./tsconfig.json\"',directory)
+        }catch (e){
+          console.log(`Restoring the changes on ./package.json & package-lock.json`);
+          try{
+            await execute('git checkout -- ./package.json ./package-lock.json',directory)
+          }catch (e){
+            console.log(`The files ./package.json & package-lock.json failed to be restored`);
+            console.log(`Typescript find some issues with the package ${key}@${version} installed as dev dependency: please update your peer dependency to exclude ${key}@${version}`);
+            return;
+          }
+          console.log(`The files ./package.json & package-lock.json have been restored`);
+
+          console.log(`Re-install the package from the restored ./package.json & package-lock.json in ${Path.basename(directory)}`);
+          try {
+            await execute(`npm ci --ignore-scripts`);
+            console.log(`The package from the restored ./package.json & package-lock.json in ${Path.basename(directory)} has been re-installed`);
+          }catch (e){
+            console.log(`The package from the restored ./package.json & package-lock.json in ${Path.basename(directory)} failed been been re-installed`);
+            return
+          }
+
+          console.log(`Typescript find some issues with the package ${key}@${version} installed as dev dependency: please update your peer dependency to exclude ${key}@${version}`);
+          return;
+        }
+        console.log(`Check the typescript implementation of the project ${Path.basename(directory)} with ${key}@${version}`);
+
+        console.log(`Restoring the changes on ./package.json & package-lock.json`);
+        try{
+          await execute('git checkout -- ./package.json ./package-lock.json',directory)
+        }catch (e){
+          console.log(`The files ./package.json & package-lock.json failed to be restored`);
+          return;
+        }
+        console.log(`The files ./package.json & package-lock.json have been restored`);
+
+
+        console.log(`Re-install the package from the restored ./package.json & package-lock.json in ${Path.basename(directory)}`);
+        try {
+          await execute(`npm ci --ignore-scripts`);
+          console.log(`The package from the restored ./package.json & package-lock.json in ${Path.basename(directory)} has been re-installed`);
+        }catch (e){
+          console.log(`The package from the restored ./package.json & package-lock.json in ${Path.basename(directory)} failed been been re-installed`);
+          return
+        }
+
+      }
+    }
+  }
+
+
+  if (error === true){
+    process.exit(1)
+    return
+  }
+
+
+
+
+
+  console.log(`Fetching the repository url in ${Path.basename(directory)}`);
+  const repository = (await execute('git config --get remote.origin.url',directory)).trim();
+  console.log(`The repository url of the directory ${Path.basename(directory)} has been fetched: ${repository}`);
+
+  const cache_directory = Path.join(directory,".github",".cache");
+  const cache_metadata = [];
+  console.log(`Creating the cache folder for ${Path.basename(directory)}`);
+  await fs.promises.mkdir(cache_directory,{
+    recursive: true
+  });
+  console.log(`The cache folder for ${Path.basename(directory)} has been created: ${cache_directory}`);
+
+  console.log(`Fetching the packages metadata from github`);
+
+  const gist = await (async () => {
+    const response = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${npm_token}`
+      }
+    });
+
+    const json = await response.json();
+    if (!(response.status >= 200 && response.status < 300)){
+      throw new Error("Failed to fetch gist file (STATUS: "+response.status+"): "+json.message);
+    }
+    const content = JSON.parse(json.files['packages.json'].content)
+
+    return content.map(item => {
+      const package = item.package;
+      return {
+        order: content.reduce((stack,item) => {
+          if (item.dependencies.includes(package)){
+            return stack + 1;
+          }
+          return stack;
+        },0),
+        value: item
+      }
+    }).sort((a,b) => a.order - b.order).map(item => item.value);
+  })();
+  const getDeep = (p) => {
+    return gist.reduce((stack,item) => {
+      if (item.dependencies.includes(p)){
+        return stack + 1;
+      }
+      return stack;
+    },0)
+  }
+  console.log(`The packages metadata has been fetched from github`);
+
+
+  const clone = async (repository, _package) => {
+    for(const item of cache_metadata){
+      if (item.repositories.includes(repository)){
+        return item;
+      }
+      if (item.package === repository){
+        return item;
+      }
+    }
+
+
+    console.log(`Extract the folder from the repository ${repository} for the project ${Path.basename(directory)}`);
+    const folder = (() => {
+      return Path.parse(repository).name;
+    })();
+    console.log(`The folder from the repository ${repository} for the project ${Path.basename(directory)} has been extracted: ${folder}`);
+
+    for(const item of cache_metadata){
+      if (item.folder === folder){
+        item.package = _package;
+        item.repositories.push(folder);
+        return item;
+      }
+    }
+
+    console.log(`Checking if the folder ${folder} has been already been cloned for the project ${Path.basename(directory)}`);
+    try {
+      await fs.promises.access(Path.join(cache_directory,folder))
+      console.log(`The folder ${folder} has been already been cloned for the project ${Path.basename(directory)}`);
+
+
+      console.log(`Updating the repository ${repository} for the project ${Path.basename(directory)}`);
+      await execute(`git reset --hard && git checkout ${MAIN_BRANCH} && git pull ${repository}`,Path.join(cache_directory,folder))
+      console.log(`The repository ${repository} for the project ${Path.basename(directory)} has been updated`);
+    }catch (e){
+      console.log(`The folder ${folder} hasn't cloned for the project ${Path.basename(directory)} (${e.message})`);
+
+      console.log(`Cloning the repository ${repository} for the project ${Path.basename(directory)}`);
+      await execute(`git clone ${repository} ${folder}`,cache_directory)
+      console.log(`The repository ${repository} for the project ${Path.basename(directory)} has been cloned`);
+    }
+
+    const _item = {
+      repositories: [repository],
+      folder: folder,
+      package: _package,
+      commit: [],
+      proceed: {},
+      error: null,
+      published: null,
+    }
+    cache_metadata.push(_item);
+    return _item;
+  };
+
+
+  console.log(`Publishing the package ${rootPackage.name}@${rootPackage.version} in the project ${Path.basename(directory)}`);
+  try {
+    await execute(`npm publish --registry=${NPM_REGISTRY}`,directory)
+  }catch (e){
+    console.log(`We couldn't publish the package ${rootPackage.name}@${rootPackage.version}`);
+    return
+  }
+  console.log(`The package lock of the project in ${Path.basename(directory)} has been published`);
+
+
+
+  const __published = async (package_name,repository) => {
+    const updated = [];
+
+    await Promise.all([
+      ... gist.map(async item => {
+        if (item.repository === repository){
+          return;
+        }
+        if (!item.dependencies.includes(package_name)){
+          return;
+        }
+
+        const metadata = await clone(item.repository,item.package);
+        const directory = Path.join(cache_directory,metadata.folder);
+        console.log(`Try to update ${package_name} in the package.json of the project ${item.package}`);
+        await execute(`ncu -u -s ${package_name}`,directory)
+        console.log(`The package ${rootPackage.name} is updated to his latest version in the project ${item.package}`);
+
+        console.log(`Check if the package.json of the project ${item.package} changed after the ${package_name} latest installation`);
+        const changed = await (async () => {
+          try {
+            await execute(`git diff --quiet --exit-code ./package.json`,directory)
+          }catch (e){
+            return true;
+          }
+
+          return false;
+        })
+        if (!changed){
+          console.log(`The package.json of the project ${item.package} did not changed after the ${package_name} latest installation`);
+          return;
+        }
+        console.log(`The package.json of the project ${item.package} changed after the ${package_name} latest installation`);
+
+
+        console.log(`Fetching the package.json of the project ${item.package}`);
+        const _package = JSON.parse(await fs.promises.readFile(Path.join(directory,"./package.json"),{encoding: "utf-8"}));
+        console.log(`The package.json of the project ${item.package} has been fetched`);
+
+        const version = {
+          ... _package["dependencies"],
+          ... _package["devDependencies"]
+        }[package_name];
+
+        console.log(`Updating the package lock of the project ${item.package} after the ${package_name} latest installation`);
+        const success = (async () => {
+          try {
+            await execute(`npm i --ignore-scripts`,directory)
+            await new Promise(r => setTimeout(r,2000));
+          }catch (e){
+            return false;
+          }
+
+          return true;
+        })()
+
+        if (success){
+          console.log(`The package lock of the project ${item.package} has been updated after the ${package_name} latest installation`);
+        }else{
+          console.error(`The package lock of the project ${item.package} has failed to update after the ${package_name} latest installation`);
+          metadata.error = "On error occurred while updating the package lock.";
+          return
+        }
+
+        console.log(`Committing ${package_name}@${version} installation in the project ${item.package}`);
+        try {
+          metadata.commit.push(`Update ${package_name} package to ${version}`);
+          await execute(`git add . && git commit -m "Update ${package_name} package to ${version}"`,directory)
+        }catch (e){
+
+        }
+        console.log(`The ${package_name}@${version} installation in the project ${item.package} has been committed`);
+        metadata.proceed[package_name] = version;
+        updated.push(metadata)
+      })
+    ]);
+
+    const published = [];
+    await Promise.all([
+      ... updated.map(async metadata => {
+        const ok = gist.every(item => {
+          if (item.package !== metadata.package){
+            return true
+          }
+
+          for(const dependency of item.dependencies){
+            if (Object.keys(metadata.proceed).includes(dependency)){
+              continue
+            }
+
+            const all = gist.find(__item => {
+              if (__item.package !== dependency){
+                return false
+              }
+
+              return __item.dependencies.includes(rootPackage.name);
+            });
+
+            if (typeof all !== "undefined"){
+              return false;
+            }
+          }
+
+          return true;
+        })
+
+        if (!ok){
+          return;
+        }
+        if (typeof metadata.error === "string"){
+          return
+        }
+
+        const directory = Path.join(cache_directory,metadata.folder)
+        console.log(`Checking the linting in the project ${metadata.package}`);
+        try {
+          await execute("npx eslint \"./src/**\" --ext \".js,.jsx,.ts,.tsx\" -c \"./.eslintrc.js\" --no-eslintrc",directory)
+        }catch (e){
+          metadata.error = "The package didn't update because the linting has some issues";
+          metadata.error = `The linter detected some issues: run 'cd \"${directory}\" && npx eslint \"./src/**\" --ext \".js,.jsx,.ts,.tsx\" -c \"./.eslintrc.js\" --no-eslintrc' to view errors`;
+          console.error(`We don't publish the package in the project ${metadata.package} because the linting has some issues`);
+          return
+        }
+        console.log(`The linting of the project in ${Path.basename(metadata.folder)} has been checked`);
+
+
+        console.log(`Checking the typescript in the project ${metadata.package}`);
+        try {
+          await execute('npx tsc --noEmit --project \"./tsconfig.json\"',directory)
+        }catch (e){
+          console.error(`We don't proceed in the project ${metadata.package} because typescript has some issues`);
+          metadata.error = `Typescript has some issues: run 'cd \"${directory}\" && npx tsc --noEmit --project \"./tsconfig.json\"' to view errors`;
+          return
+        }
+        console.log(`The typescript of the project ${metadata.package} has been checked`);
+
+
+
+
+        console.log(`Fetching the package.json in the project ${metadata.package}`);
+        const _package = JSON.parse(await fs.promises.readFile(Path.join(directory,"./package.json"),{encoding: "utf-8"}));
+        console.log(`The package.json in the project ${metadata.package} has been fetched`);
+
+        const peerDependencies = _package.peerDependencies;
+        if (typeof peerDependencies === "object" && peerDependencies !== null){
+          for(const [ name,version] of Object.entries(metadata.proceed)){
+            const peer = peerDependencies[name];
+            if (typeof peer !== "string"){
+              continue;
+            }
+
+            if (semver.satisfies(version,peerDependencies[name])){
+              continue;
+            }
+
+            peerDependencies[name] = peerDependencies[name]+" || "+version;
+
+            console.log(`Updating the package.json the project ${metadata.package} to accept ${name}@${version} in the peer dependency`);
+            await fs.promises.writeFile(Path.join(directory,"./package.json"),JSON.stringify(_package,null,"\t"));
+            console.log(`The package.json the project ${metadata.package} to accept ${name}@${version} in the peer dependency has been updated`);
+
+            console.log(`Committing the package.json update the project ${metadata.package} to accept ${name}@${version} in the peer dependency`);
+            try {
+              await execute(`git add . && git commit -m "Update the peer dependency to accept the package ${name} with the version ${version}"`,directory)
+            }catch (e){
+
+            }
+            metadata.commit.push(`Update the peer dependency to accept the package ${name} with the version ${version}"`);
+            console.log(`The package.json update the project ${metadata.package} to accept ${name}@${version} in the peer dependency has been committed`);
+          }
+        }
+
+
+        _package.version = semver.inc(_package.version, 'patch');
+        const version = _package.version;
+
+        if (typeof version !== "string"){
+          metadata.error = "Failed to patch the semversion";
+          return
+        }
+
+        console.log(`Updating the package.json of the project ${metadata.package} to patch the version to ${_package.version}`);
+        await fs.promises.writeFile(Path.join(directory,"./package.json"),JSON.stringify(_package,null,"\t"));
+        console.log(`The package.json in the project ${metadata.package} to patch the version to ${_package.version} has been updated`);
+
+        console.log(`Committing the package.json update the project ${metadata.package} with the updated ${_package.version} package version`);
+        try {
+          await execute(`git add . && git commit -m "Patch the version to ${_package.version}"`,metadata.directory)
+          metadata.commit.push(`Patch the version to ${_package.version}`);
+        }catch (e){
+
+        }
+        console.log(`The package.json update of the project ${metadata.package} with the updated ${_package.version} package version has been committed`);
+
+
+        console.log(`Publishing the package ${_package.name}@${_package.version}`);
+        try {
+          await execute(`npm publish --registry=${NPM_REGISTRY}`,directory)
+          metadata.published = _package.version;
+        }catch (e){
+          console.log(`The package ${_package.name}@${_package.version} failed to have been published`);
+          metadata.error = `The package ${_package.name}@${_package.version} failed to have been published`;
+          return
+        }
+        console.log(`The package ${_package.name}@${_package.version} has been published`);
+
+
+        published.push(async () => {
+          await __published(metadata.package,metadata.repositories[0]);
+        })
+      })
+    ])
+
+    for(const item of published){
+      await item();
+    }
+  }
+
+
+  await __published(rootPackage.name,repository);
+
+
+  await Promise.all(cache_metadata.map(async metadata => {
+    const directory = Path.join(cache_directory,metadata.folder)
+    console.log(`Git push the project ${metadata.package}`);
+    try {
+      await execute(`git push --no-verify`,directory)
+    }catch (e){
+
+    }
+  }))
+
+  console.log("");
+
+  for(const metadata of cache_metadata){
+    console.log(metadata.package);
+    console.log("\tCommit:");
+    console.log(metadata.commit.map(s => "\t\t - "+s).join("\r\n"));
+
+    if (metadata.error){
+      console.log("\tError: "+metadata.error);
+    }
+
+    if (metadata.published){
+      console.log("\tPublished: "+metadata.published);
+    }
+  }
+}
+
+(async () => {
+  await publish(Path.join(__dirname,"../../"))
+})().catch(console.trace);
