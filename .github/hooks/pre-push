@@ -449,7 +449,6 @@ const publish = async (directory) => {
         const success = (async () => {
           try {
             await execute(`npm i --ignore-scripts`,directory)
-            await new Promise(r => setTimeout(r,2000));
           }catch (e){
             return false;
           }
